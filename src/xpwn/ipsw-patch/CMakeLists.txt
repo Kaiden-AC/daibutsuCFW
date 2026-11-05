@@ -99,6 +99,4 @@ IF(WIN32)
 ENDIF(WIN32)
 
 install(TARGETS ipsw xpwntool validate ticket RUNTIME DESTINATION .)
-install(DIRECTORY FirmwareBundles/ DESTINATION FirmwareBundles)
-install(DIRECTORY bundles/ DESTINATION bundles)
 
