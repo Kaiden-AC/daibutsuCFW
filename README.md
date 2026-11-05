@@ -1,29 +1,26 @@
-# daibutsuCFW  
+# daibutsuCFW - xpwn
 
-- daibutsuCFW fork used for [Legacy iOS Kit](https://github.com/LukeZGD/Legacy-iOS-Kit)
-- idevicererestore and xpwn builds for Linux and Windows can be [downloaded here](https://github.com/LukeZGD/daibutsuCFW/releases/tag/latest)
-- For idevicererestore, the patch version is used for Legacy iOS Kit - It uses `tmp/tmp.bbfw` and `tmp/BuildManifest.plist` for the baseband to be used
-- haxx_overwrite supports all A5/A6 devices iOS 8.0-8.4.1
-- Offsets are obtained using updated dsc patchfinder in [daibutsu](https://github.com/kok3shidoll/daibutsu)
+This repository contains **xpwn** - the iPhone Dev Team's toolchain for iOS firmware exploitation and custom firmware creation.
 
-### List of devices supported by haxx_overwrite (dyld haxx)
-- iPhone 4S [iPhone4,1]
-- iPhone 5 [iPhone5,1]
-- iPhone 5 [iPhone5,2]
-- iPhone 5C [iPhone5,3]
-- iPhone 5C [iPhone5,4]
-- iPod touch 5th gen [iPod5,1]
-- iPad 2 [iPad2,1]
-- iPad 2 [iPad2,2]
-- iPad 2 [iPad2,3]
-- iPad 2 [iPad2,4]
-- iPad mini [iPad2,5]
-- iPad mini [iPad2,6]
-- iPad mini [iPad2,7]
-- iPad 3rd gen [iPad3,1]
-- Pad 3rd gen [iPad3,2]
-- iPad 3rd gen [iPad3,3]
-- iPad 4th gen [iPad3,4]
-- iPad 4th gen [iPad3,5]
-- iPad 4th gen [iPad3,6]
+Based on the original work by [LukeZGD](https://github.com/LukeZGD/daibutsuCFW).
 
+## Building xpwn
+
+See [src/xpwn/BUILD.md](src/xpwn/BUILD.md) for compilation instructions.
+
+## Tools Included
+
+| Tool | Description |
+|------|-------------|
+| `xpwntool` | Core exploitation/patching tool |
+| `ipsw` | IPSW firmware manipulation |
+| `imagetool` | Disk image manipulation |
+| `validate` | Ticket/validation utility |
+| `ticket` | Ticket generation |
+| `dmg` | Apple DMG handling |
+| `hdutil` | Apple disk image utility |
+| `hfsplus` | Apple HFS+ filesystem utility |
+
+## License
+
+See [src/xpwn/LICENSE](src/xpwn/LICENSE) (BSD-style license from the iPhone Dev Team).
