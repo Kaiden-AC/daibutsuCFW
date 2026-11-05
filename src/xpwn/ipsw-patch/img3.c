@@ -331,8 +331,9 @@ void freeImg3Root(Img3Element* element) {
 void readImg3Root(AbstractFile* file, Img3Element* element) {
 	Img3Element* children;
 	Img3Element* current;
-	uint32_t remaining;
 	AppleImg3RootHeader* header;
+	off_t startPos, endPos;
+	int iteration = 0;
 
 	children = NULL;
 
@@ -342,9 +343,12 @@ void readImg3Root(AbstractFile* file, Img3Element* element) {
 	file->read(file, &(header->extra), sizeof(AppleImg3RootExtra));
 	flipAppleImg3RootExtra(&(header->extra));
 
-	remaining = header->base.dataSize;
+	/* Use file position for robust parsing instead of trusting header->base.dataSize */
+	startPos = file->tell(file);
+	endPos = startPos + header->base.dataSize;
 
-	while(remaining > 0) {
+	/* Safety: limit iterations to prevent infinite loops on malformed images */
+	while(file->tell(file) < endPos && iteration < 64) {
 		if(children != NULL) {
 			current->next = readImg3Element(file);
 			current = current->next;
@@ -352,7 +356,13 @@ void readImg3Root(AbstractFile* file, Img3Element* element) {
 			current = readImg3Element(file);
 			children = current;
 		}
-		remaining -= current->header->size;
+
+		/* Safety: break if element size is invalid (prevents infinite loop on garbage) */
+		if(current->header->size == 0 || current->header->size > (uint32_t)(endPos - file->tell(file) + current->header->size)) {
+			break;
+		}
+
+		iteration++;
 	}
 
 	element->data = (void*) children;
