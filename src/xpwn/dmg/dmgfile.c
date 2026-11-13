@@ -22,7 +22,12 @@ static void cacheRun(DMG* dmg, BLKXTable* blkx, int run) {
 	}
 	
 	bufferSize = SECTOR_SIZE * blkx->runs[run].sectorCount;
-	
+	/* a run's compressed length may exceed its uncompressed size (incompressible data),
+	   so the staging buffer must be sized accordingly */
+	if((uint64_t) blkx->runs[run].compLength > (uint64_t) bufferSize) {
+		bufferSize = (size_t) blkx->runs[run].compLength;
+	}
+
 	dmg->runData = (void*) malloc(bufferSize);
 	memset(dmg->runData, 0, bufferSize);
 	
@@ -131,6 +136,11 @@ static int dmgFileWrite(io_func* io, off_t location, size_t size, void *buffer) 
 }
 
 
+static int dmgTruncate(io_func* io, off_t size) {
+	/* DMGs cannot be safely resized in place */
+	return FALSE;
+}
+
 static void closeDmgFile(io_func* io) {
 	DMG* dmg;
 	
@@ -203,6 +213,7 @@ io_func* openDmgFile(AbstractFile* abstractIn) {
 		toReturn->read = &dmgFileReadPlain;
 		toReturn->write = &dmgFileWritePlain;
 		toReturn->close = &closeDmgFile; // yes, it is safe
+		toReturn->truncate = &dmgTruncate;
 		return toReturn;
 	}
 	
@@ -239,6 +250,7 @@ io_func* openDmgFile(AbstractFile* abstractIn) {
 	toReturn->read = &dmgFileRead;
 	toReturn->write = &dmgFileWrite;
 	toReturn->close = &closeDmgFile;
+	toReturn->truncate = &dmgTruncate;
 	
 	return toReturn;
 }

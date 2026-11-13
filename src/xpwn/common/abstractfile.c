@@ -3,6 +3,12 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+#ifdef WIN32
+#include <io.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "abstractfile.h"
 #include "common.h"
@@ -204,6 +210,70 @@ void closeAbsFile(io_func* io) {
 }
 
 
+int absFileTruncate(io_func* io, off_t size) {
+	AbstractFile* file;
+	file = (AbstractFile*) io->data;
+
+	/* a negative size is a no-op probe: succeed if the backing store can be truncated */
+	switch(file->type) {
+		case AbstractFileTypeFile: {
+			FILE* f = (FILE*) file->data;
+#ifdef WIN32
+			if(size < 0) {
+				return TRUE;
+			}
+			fflush(f);
+			return _chsize(_fileno(f), (long) size) == 0 ? TRUE : FALSE;
+#else
+			struct stat st;
+			if(size < 0) {
+				return fstat(fileno(f), &st) == 0 ? TRUE : FALSE;
+			}
+			fflush(f);
+			return ftruncate(fileno(f), size) == 0 ? TRUE : FALSE;
+#endif
+		}
+		case AbstractFileTypeMem: {
+			MemWrapperInfo* info = (MemWrapperInfo*) file->data;
+			void* newBuffer;
+			if(size < 0) {
+				return TRUE;
+			}
+			newBuffer = realloc(*(info->buffer), (size_t) size);
+			if(newBuffer == NULL && size != 0) {
+				return FALSE;
+			}
+			*(info->buffer) = newBuffer;
+			info->bufferSize = (size_t) size;
+			if(info->offset > (size_t) size) {
+				info->offset = (size_t) size;
+			}
+			return TRUE;
+		}
+		case AbstractFileTypeMemFile: {
+			MemFileWrapperInfo* info = (MemFileWrapperInfo*) file->data;
+			void* newBuffer;
+			if(size < 0) {
+				return TRUE;
+			}
+			newBuffer = realloc(*(info->buffer), (size_t) size);
+			if(newBuffer == NULL && size != 0) {
+				return FALSE;
+			}
+			*(info->buffer) = newBuffer;
+			*(info->bufferSize) = (size_t) size;
+			info->actualBufferSize = (size_t) size;
+			if(info->offset > (size_t) size) {
+				info->offset = (size_t) size;
+			}
+			return TRUE;
+		}
+		default:
+			/* not backed by anything that can be truncated */
+			return size < 0 ? TRUE : FALSE;
+	}
+}
+
 io_func* IOFuncFromAbstractFile(AbstractFile* file) {
 	io_func* io;
 
@@ -212,6 +282,7 @@ io_func* IOFuncFromAbstractFile(AbstractFile* file) {
 	io->read = &absFileRead;
 	io->write = &absFileWrite;
 	io->close = &closeAbsFile;
+	io->truncate = &absFileTruncate;
 
 	return io;
 }

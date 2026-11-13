@@ -252,6 +252,320 @@ void grow_hfs(Volume* volume, uint64_t newSize) {
 	updateVolume(volume);
 }
 
+/* reads the whole allocation bitmap into memory; caller frees */
+static unsigned char* readAllocationBitmap(Volume* volume, uint64_t* outSize) {
+	uint64_t logicalSize = volume->volumeHeader->allocationFile.logicalSize;
+	unsigned char* map;
+	uint64_t offset;
+
+	if(logicalSize == 0) {
+		return NULL;
+	}
+
+	map = (unsigned char*) malloc(logicalSize);
+	if(map == NULL) {
+		return NULL;
+	}
+
+	offset = 0;
+	while(offset < logicalSize) {
+		size_t chunk = (logicalSize - offset) > (1024 * 1024) ? (1024 * 1024) : (size_t)(logicalSize - offset);
+		if(!READ(volume->allocationFile, offset, chunk, map + offset)) {
+			free(map);
+			return NULL;
+		}
+		offset += chunk;
+	}
+
+	*outSize = logicalSize;
+	return map;
+}
+
+/* returns the first used block in [startBlock, endBlock), or -1 if there is none */
+static int64_t bitmapFindUsedInRange(const unsigned char* map, uint64_t mapSize, uint32_t startBlock, uint32_t endBlock) {
+	uint32_t byteStart = startBlock / 8;
+	uint32_t byteEnd = (endBlock + 7) / 8;
+	uint32_t i;
+
+	if((uint64_t)byteEnd > mapSize) {
+		byteEnd = (uint32_t) mapSize;
+	}
+	if((uint64_t)byteStart >= mapSize) {
+		return -1;
+	}
+
+	for(i = byteStart; i < byteEnd; i++) {
+		unsigned char byte = map[i];
+		uint32_t validBits = 8;
+
+		if(i == (endBlock - 1) / 8 && (endBlock % 8) != 0) {
+			validBits = endBlock % 8;
+		}
+		if(i == byteStart && (startBlock % 8) != 0) {
+			byte &= (unsigned char)(0xFF >> (startBlock % 8));
+		}
+		if(validBits < 8) {
+			byte &= (unsigned char)(0xFF << (8 - validBits));
+		}
+
+		if(byte != 0) {
+			int b;
+			for(b = 7; b >= 0; b--) {
+				if(byte & (1 << b)) {
+					uint32_t block = (i * 8) + (uint32_t)(7 - b);
+					if(block >= startBlock && block < endBlock) {
+						return block;
+					}
+				}
+			}
+		}
+	}
+
+	return -1;
+}
+
+/* returns the highest used block below limitBlock, or -1 if there is none */
+static int64_t bitmapHighestUsed(const unsigned char* map, uint64_t mapSize, uint32_t limitBlock) {
+	uint32_t byteIdx;
+	uint32_t validBits;
+
+	if(limitBlock == 0 || mapSize == 0) {
+		return -1;
+	}
+
+	if((uint64_t) limitBlock > mapSize * 8) {
+		limitBlock = (uint32_t) (mapSize * 8);
+	}
+
+	byteIdx = (limitBlock - 1) / 8;
+	validBits = limitBlock - (byteIdx * 8);
+
+	for(;;) {
+		unsigned char byte = map[byteIdx];
+
+		if(validBits < 8) {
+			byte &= (unsigned char)(0xFF << (8 - validBits));
+		}
+
+		if(byte != 0) {
+			int b;
+			for(b = 0; b <= 7; b++) {
+				/* block = byteIdx * 8 + (7 - b); b counts up from 0 so the first
+				   match is the highest block in the byte */
+				if(byte & (1 << b)) {
+					uint32_t block = (byteIdx * 8) + (uint32_t)(7 - b);
+					if(block < limitBlock) {
+						return block;
+					}
+				}
+			}
+		}
+
+		if(byteIdx == 0) {
+			break;
+		}
+		byteIdx--;
+		validBits = 8;
+	}
+
+	return -1;
+}
+
+/* The actual work for shrinking a volume. newBlocks must be >= 2 and < the current totalBlocks.
+   Callers are expected to have sanity-checked newBlocks, but the bitmap is re-validated here so
+   that no live data is ever clobbered. The backing store is truncated last, after all metadata
+   is consistent. */
+static int shrinkVolume(Volume* volume, uint32_t newBlocks) {
+	HFSPlusVolumeHeader* volumeHeader = volume->volumeHeader;
+	uint32_t blockSize = volumeHeader->blockSize;
+	uint32_t oldTotalBlocks = volumeHeader->totalBlocks;
+	uint64_t newSize = (uint64_t) newBlocks * (uint64_t) blockSize;
+	uint64_t newMapSize = ((uint64_t) newBlocks + 7) / 8;
+	unsigned char* map;
+	uint64_t mapSize;
+	int64_t used;
+
+	if(newBlocks >= oldTotalBlocks) {
+		printf("Cannot shrink volume: new size is not smaller than the current size\n");
+		return FALSE;
+	}
+
+	/* pre-flight: make sure the backing store can be truncated (a negative size is a no-op probe) */
+	if(!TRUNCATE(volume->image, -1)) {
+		printf("Cannot shrink volume: image is read-only (compressed or partition-mapped DMGs cannot be written)\n");
+		return FALSE;
+	}
+
+	map = readAllocationBitmap(volume, &mapSize);
+	if(map == NULL) {
+		printf("Cannot shrink volume: cannot read the allocation file\n");
+		return FALSE;
+	}
+
+	if(mapSize < ((uint64_t) oldTotalBlocks + 7) / 8) {
+		free(map);
+		printf("Cannot shrink volume: the allocation file is too small to describe the volume\n");
+		return FALSE;
+	}
+
+	/* every block in [newBlocks - 1, oldTotalBlocks - 1) becomes invalid or holds the new
+	   alternate volume header, so they all must be free (the old alternate volume header
+	   block at oldTotalBlocks - 1 is excluded, since it contains no user data) */
+	used = bitmapFindUsedInRange(map, mapSize, newBlocks - 1, oldTotalBlocks - 1);
+	free(map);
+
+	if(used >= 0) {
+		printf("Cannot shrink volume: block %" PRId64 " is in use\n", used);
+		return FALSE;
+	}
+
+	/* unreserve the old alternate volume header block; it is being deleted */
+	setBlockUsed(volume, oldTotalBlocks - 1, 0);
+
+	/* shrink the allocation file; freed blocks are returned to the system */
+	if(volumeHeader->allocationFile.logicalSize > newMapSize) {
+		if(!allocate((RawFile*) (volume->allocationFile->data), newMapSize)) {
+			printf("Cannot shrink volume: failed to shrink the allocation file\n");
+			return FALSE;
+		}
+	}
+
+	/* mask off garbage bits for blocks that no longer exist in the last partial map byte */
+	if((newBlocks % 8) != 0) {
+		unsigned char byte = 0;
+		off_t offset = (off_t) (newMapSize - 1);
+		ASSERT(READ(volume->allocationFile, offset, 1, &byte), "READ");
+		byte &= (unsigned char)(0xFF << (8 - (newBlocks % 8)));
+		ASSERT(WRITE(volume->allocationFile, offset, 1, &byte), "WRITE");
+	}
+
+	/* recount free blocks in the new map */
+	{
+		uint32_t freeBlocks = 0;
+		uint32_t bitBlock = 0;
+		uint64_t offset = 0;
+		unsigned char chunk[65536];
+
+		while(offset < newMapSize) {
+			size_t want = (newMapSize - offset) > sizeof(chunk) ? sizeof(chunk) : (size_t)(newMapSize - offset);
+			size_t j;
+
+			ASSERT(READ(volume->allocationFile, offset, want, chunk), "READ");
+			for(j = 0; j < want; j++) {
+				unsigned char byte = chunk[j];
+				int b;
+				for(b = 7; b >= 0; b--) {
+					uint32_t block = bitBlock + (uint32_t)(7 - b);
+					if(block >= newBlocks) {
+						break;
+					}
+					if(!(byte & (1 << b))) {
+						freeBlocks++;
+					}
+				}
+				bitBlock += 8;
+			}
+			offset += want;
+		}
+
+		volumeHeader->freeBlocks = freeBlocks;
+	}
+
+	/* make sure the allocation hint stays in range */
+	if(volumeHeader->nextAllocation >= newBlocks) {
+		volumeHeader->nextAllocation = 0;
+	}
+
+	/* update the volume geometry */
+	volumeHeader->totalBlocks = newBlocks;
+
+	/* reserve the last block for the new alternate volume header */
+	setBlockUsed(volume, newBlocks - 1, 1);
+	volumeHeader->freeBlocks--;
+
+	/* truncate the backing store */
+	if(!TRUNCATE(volume->image, (off_t) newSize)) {
+		printf("Warning: volume shrunk, but the backing store could not be truncated\n");
+	}
+
+	updateVolume(volume);
+
+	return TRUE;
+}
+
+void shrink_hfs(Volume* volume, uint64_t newSize) {
+	uint64_t blockSize = volume->volumeHeader->blockSize;
+	uint64_t newBlocks64 = newSize / blockSize;
+
+	if((newSize % blockSize) != 0) {
+		printf("Warning: size is not a multiple of the block size (%" PRIu64 "), rounding down\n", blockSize);
+	}
+
+	if(newBlocks64 < 2) {
+		printf("Cannot shrink volume: new size is too small\n");
+		return;
+	}
+
+	if(newBlocks64 >= volume->volumeHeader->totalBlocks) {
+		printf("Cannot shrink volume: new size is not smaller than the current size\n");
+		return;
+	}
+
+	/* newBlocks fits into 32 bits here because newBlocks64 < totalBlocks (else shrinkVolume rejects it) */
+	if(shrinkVolume(volume, (uint32_t) newBlocks64)) {
+		printf("shrank volume to: %" PRIu64 "\n", (uint64_t) volume->volumeHeader->totalBlocks * blockSize);
+	} else {
+		printf("failed to shrink volume\n");
+	}
+}
+
+void shrink_hfs_min(Volume* volume) {
+	HFSPlusVolumeHeader* volumeHeader = volume->volumeHeader;
+	uint32_t oldTotalBlocks = volumeHeader->totalBlocks;
+	uint64_t mapSize;
+	unsigned char* map;
+	int64_t highest;
+	uint32_t newBlocks;
+
+	map = readAllocationBitmap(volume, &mapSize);
+	if(map == NULL) {
+		printf("Cannot shrink volume: cannot read the allocation file\n");
+		return;
+	}
+
+	if(mapSize < ((uint64_t) oldTotalBlocks + 7) / 8) {
+		free(map);
+		printf("Cannot shrink volume: the allocation file is too small to describe the volume\n");
+		return;
+	}
+
+	/* the absolute lowest the volume can be shrunk to is one block past the highest
+	   used block (excluding the alternate volume header block), plus one block for
+	   the new alternate volume header */
+	highest = bitmapHighestUsed(map, mapSize, oldTotalBlocks - 1);
+	free(map);
+
+	if(highest < 0) {
+		printf("Cannot shrink volume: cannot determine the highest used block\n");
+		return;
+	}
+
+	newBlocks = (uint32_t) highest + 2;
+
+	if(newBlocks >= oldTotalBlocks) {
+		printf("Volume is already at its minimum size\n");
+		return;
+	}
+
+	printf("highest used block: %" PRId64 ", shrinking to %" PRIu32 " blocks\n", highest, newBlocks);
+
+	if(shrinkVolume(volume, newBlocks)) {
+		printf("shrank volume to: %" PRIu64 "\n", (uint64_t) volume->volumeHeader->totalBlocks * volume->volumeHeader->blockSize);
+	} else {
+		printf("failed to shrink volume\n");
+	}
+}
+
 void removeAllInFolder(HFSCatalogNodeID folderID, Volume* volume, const char* parentName) {
 	CatalogRecordList* list;
 	CatalogRecordList* theList;
@@ -896,6 +1210,8 @@ void hfs_untar(Volume* volume, AbstractFile* tarFile) {
 	char block[512];
 	char *longName = NULL;
 	char *longLink = NULL;
+	char *paxPath = NULL;      /* POSIX.1-2001 pax extended header keywords (apply to the next entry) */
+	char *paxLinkPath = NULL;
 
 	while(curRecord < tarSize) {
 		tarFile->seek(tarFile, curRecord);
@@ -929,10 +1245,125 @@ void hfs_untar(Volume* volume, AbstractFile* tarFile) {
 			tarFile->read(tarFile, longLink, size);
 			goto loop;
 		}
-		if (longName)
+		if (block[156] == 'x' || block[156] == 'g') {
+			/* POSIX.1-2001 extended header ("mhjvzp"): lines of "<decimal-length> <keyword>=<value>\n"
+			   where the length counts the entire line; we honour path= and linkpath= */
+			char* data = (char*) malloc((size_t) size + 1);
+			size_t i = 0;
+
+			tarFile->seek(tarFile, curRecord + 512);
+			tarFile->read(tarFile, data, size);
+			data[size] = '\0';
+
+			while(i < size) {
+				unsigned long recLen = 0;
+				size_t recStart, recEnd;
+				char* eq;
+				char* nl;
+				char* value;
+
+				recStart = i;
+				while(i < size && data[i] != ' ') {
+					if(data[i] < '0' || data[i] > '9') { recLen = 0; break; }
+					recLen = (recLen * 10) + (unsigned long)(data[i] - '0');
+					i++;
+				}
+
+				if(i >= size || data[i] != ' ' || recLen == 0) {
+					break;
+				}
+
+				i++; /* skip the space */
+				recEnd = recStart + recLen;
+
+				if(recEnd > size) {
+					break;
+				}
+
+				eq = (char*) memchr(data + i, '=', recEnd - i);
+
+				if(eq != NULL) {
+					*eq = '\0';
+					value = eq + 1;
+					nl = (char*) memchr(value, '\n', recEnd - (size_t)(value - data));
+
+					if(nl != NULL) {
+						*nl = '\0';
+					}
+
+					if(strcmp(data + i, "path") == 0) {
+						free(paxPath);
+						paxPath = strdup(value);
+					} else if(strcmp(data + i, "linkpath") == 0) {
+						free(paxLinkPath);
+						paxLinkPath = strdup(value);
+					}
+
+					*eq = '=';
+				}
+
+				i = recEnd;
+			}
+
+			free(data);
+			goto loop;
+		}
+
+		if (longName) {
 			fileName = longName;
+		} else if (strncmp(&block[257], "ustar", 5) == 0 && block[345] != '\0') {
+			/* ustar splits long paths between the prefix field (offset 345) and the name field */
+			size_t prefixLen = 0;
+			size_t nameLen = 0;
+			while (prefixLen < 155 && block[345 + prefixLen] != '\0') prefixLen++;
+			while (nameLen < 100 && block[0 + nameLen] != '\0') nameLen++;
+			{
+				char* full = (char*) malloc(prefixLen + 1 + nameLen + 1);
+				memcpy(full, &block[345], prefixLen);
+				full[prefixLen] = '/';
+				memcpy(full + prefixLen + 1, &block[0], nameLen);
+				full[prefixLen + 1 + nameLen] = '\0';
+				longName = full; /* freed at the end of the record like any other long name */
+				fileName = longName;
+			}
+		} else {
+			/* bound the name field in case it is exactly 100 bytes with no terminating NUL */
+			size_t nameLen = 0;
+			while(nameLen < 100 && block[nameLen] != '\0') nameLen++;
+			if(nameLen == 100) {
+				longName = (char*) malloc(101);
+				memcpy(longName, block, 100);
+				longName[100] = '\0';
+				fileName = longName;
+			}
+		}
+
+		if(target == &block[157]) {
+			/* bound the linkname field in the same way */
+			size_t linkLen = 0;
+			while(linkLen < 100 && block[157 + linkLen] != '\0') linkLen++;
+			if(linkLen == 100) {
+				longLink = (char*) malloc(101);
+				memcpy(longLink, &block[157], 100);
+				longLink[100] = '\0';
+			}
+		}
 		if (longLink)
 			target = longLink;
+
+		/* pax extended headers override the ustar fields for the entry they precede */
+		if(paxPath) {
+			free(longName);
+			longName = paxPath;
+			paxPath = NULL;
+			fileName = longName;
+		}
+		if(paxLinkPath) {
+			free(longLink);
+			longLink = paxLinkPath;
+			paxLinkPath = NULL;
+			target = longLink;
+		}
 
 		if(fileName[0] == '\0')
 			break;
@@ -992,5 +1423,287 @@ loop:
 		curRecord = (curRecord + 512) + ((size + 511) / 512 * 512);
 	}
 
+	free(paxPath);
+	free(paxLinkPath);
 }
 
+
+/* ---------- tar writer (ustar with GNU long name/long link extensions) ---------- */
+
+static void tarWriteOctal(unsigned char* field, size_t fieldSize, uint64_t value) {
+	/* zero-padded octal with a trailing NUL, like classic tar writers */
+	snprintf((char*) field, fieldSize, "%0*llo", (int) fieldSize - 1, (unsigned long long) value);
+}
+
+static void tarWritePadding(AbstractFile* outFile, uint64_t size) {
+	static const unsigned char zeros[512];
+	uint64_t pad = (512 - (size % 512)) % 512;
+
+	if(pad > 0) {
+		outFile->write(outFile, (void*) zeros, (size_t) pad);
+	}
+}
+
+static uint64_t tarSumHeader(const unsigned char* header) {
+	uint64_t sum = 0;
+	int i;
+
+	for(i = 0; i < 512; i++) {
+		if(i >= 148 && i < 156) {
+			sum += 0x20; /* the checksum field is treated as spaces */
+		} else {
+			sum += header[i];
+		}
+	}
+
+	return sum;
+}
+
+static void tarFinishHeader(unsigned char* header) {
+	uint64_t sum = tarSumHeader(header);
+
+	memset(header + 148, 0x20, 8);
+	/* 6 octal digits + a space + NUL terminator, exactly like GNU tar */
+	snprintf((char*) header + 148, 8, "%06llo ", (unsigned long long) sum);
+}
+
+/* the GNU long name/long link pseudo-entry used when a path (or link target)
+   is too long for the ustar name/prefix fields */
+static void tarWriteLongEntry(AbstractFile* outFile, const char* name, char typeflag) {
+	unsigned char header[512];
+	uint64_t size = strlen(name) + 1; /* include the trailing NUL */
+
+	memset(header, 0, sizeof(header));
+	strcpy((char*) header, "././@LongLink");
+	tarWriteOctal(header + 100, 8, 0644);
+	tarWriteOctal(header + 108, 8, 0);
+	tarWriteOctal(header + 116, 8, 0);
+	tarWriteOctal(header + 124, 12, size);
+	tarWriteOctal(header + 136, 12, 0);
+	memset(header + 148, 0x20, 8);
+	header[156] = (unsigned char) typeflag;
+	memcpy(header + 257, "ustar\0", 6);
+	memcpy(header + 263, "00", 2);
+	tarFinishHeader(header);
+
+	outFile->write(outFile, header, sizeof(header));
+	outFile->write(outFile, name, (size_t) size);
+	tarWritePadding(outFile, size);
+}
+
+static void tarWriteHeader(AbstractFile* outFile, const char* name, const char* linkname,
+                           uint32_t mode, uint32_t uid, uint32_t gid, uint64_t size,
+                           uint32_t appleTime, char typeflag) {
+	unsigned char header[512];
+	unsigned char shortName[101];
+	size_t nameLen = strlen(name);
+
+	memset(header, 0, sizeof(header));
+	memset(shortName, 0, sizeof(shortName));
+
+	if(nameLen <= 100) {
+		memcpy(shortName, name, nameLen);
+	} else {
+		/* try a ustar prefix/name split at a '/' */
+		int foundSplit = 0;
+		const char* p;
+
+		p = name + nameLen;
+		while(p > name + 1) {
+			p--;
+			if(*p == '/') {
+				size_t prefixLen = (size_t)(p - name);
+				size_t restLen = nameLen - prefixLen - 1;
+				if(prefixLen > 0 && prefixLen <= 155 && restLen > 0 && restLen <= 100) {
+					memcpy(header + 345, name, prefixLen); /* prefix field at offset 345 */
+					memcpy(shortName, p + 1, restLen);
+					foundSplit = 1;
+					break;
+				}
+			}
+		}
+
+		if(!foundSplit) {
+			/* no ustar split possible; use a GNU long name entry */
+			tarWriteLongEntry(outFile, name, 'L');
+			memcpy(shortName, name, 100);
+		}
+	}
+
+	if(linkname != NULL && strlen(linkname) > 100) {
+		tarWriteLongEntry(outFile, linkname, 'K');
+	}
+
+	memcpy(header, shortName, 100);
+	tarWriteOctal(header + 100, 8, mode);
+	tarWriteOctal(header + 108, 8, uid);
+	tarWriteOctal(header + 116, 8, gid);
+	tarWriteOctal(header + 124, 12, size);
+	tarWriteOctal(header + 136, 12, APPLE_TO_UNIX_TIME(appleTime));
+	memset(header + 148, 0x20, 8);
+	header[156] = (unsigned char) typeflag;
+	if(linkname != NULL) {
+		strncpy((char*) header + 157, linkname, 100);
+	}
+	memcpy(header + 257, "ustar\0", 6);
+	memcpy(header + 263, "00", 2);
+	tarFinishHeader(header);
+
+	outFile->write(outFile, header, sizeof(header));
+}
+
+static uint64_t tarFileDataSize(Volume* volume, HFSPlusCatalogFile* file) {
+	if(file->permissions.ownerFlags & UF_COMPRESSED) {
+		io_func* io = openHFSPlusCompressed(volume, file);
+		if(io != NULL) {
+			uint64_t size = ((HFSPlusCompressed*) io->data)->decmpfs->size;
+			CLOSE(io);
+			return size;
+		}
+	}
+
+	return file->dataFork.logicalSize;
+}
+
+static void hfs_tar_record(Volume* volume, AbstractFile* outFile, HFSPlusCatalogRecord* record, const char* relativePath, unsigned int* count, uint64_t* totalBytes);
+
+static void hfs_tar_folder(Volume* volume, AbstractFile* outFile, HFSCatalogNodeID folderID, const char* relativePath, unsigned int* count, uint64_t* totalBytes) {
+	CatalogRecordList* theList;
+	CatalogRecordList* list;
+	char* name;
+
+	theList = list = getFolderContents(folderID, volume);
+
+	while(list != NULL) {
+		name = unicodeToAscii(&list->name);
+		if(name[0] == '\0' || strncmp(name, ".HFS+ Private Directory Data", sizeof(".HFS+ Private Directory Data") - 1) == 0) {
+			free(name);
+			list = list->next;
+			continue;
+		}
+
+		{
+			char childRel[2048];
+			int ok;
+
+			if(relativePath[0] == '\0') {
+				ok = snprintf(childRel, sizeof(childRel), "%s", name) < (int) sizeof(childRel);
+			} else {
+				ok = snprintf(childRel, sizeof(childRel), "%s/%s", relativePath, name) < (int) sizeof(childRel);
+			}
+
+			if(ok) {
+				hfs_tar_record(volume, outFile, list->record, childRel, count, totalBytes);
+			} else {
+				printf("Warning: path too long, skipping: %s\n", name);
+			}
+		}
+
+		free(name);
+		list = list->next;
+	}
+
+	releaseCatalogRecordList(theList);
+}
+
+static void hfs_tar_record(Volume* volume, AbstractFile* outFile, HFSPlusCatalogRecord* record, const char* relativePath, unsigned int* count, uint64_t* totalBytes) {
+	if(record->recordType == kHFSPlusFolderRecord) {
+		HFSPlusCatalogFolder* folder = (HFSPlusCatalogFolder*) record;
+		char dirName[2048];
+
+		snprintf(dirName, sizeof(dirName), "%s/", relativePath);
+		tarWriteHeader(outFile, dirName, NULL, folder->permissions.fileMode & 07777,
+					   folder->permissions.ownerID, folder->permissions.groupID,
+					   0, folder->contentModDate, '5');
+		(*count)++;
+		if(!silence) {
+			printf("directory: %s (%04o)\n", dirName, folder->permissions.fileMode & 07777);
+		}
+
+		hfs_tar_folder(volume, outFile, folder->folderID, relativePath, count, totalBytes);
+	} else if(record->recordType == kHFSPlusFileRecord) {
+		HFSPlusCatalogFile* file = (HFSPlusCatalogFile*) record;
+		char* linkName = NULL;
+
+		if((file->permissions.fileMode & 0170000) == 0120000) {
+			linkName = getLinkName(volume, file);
+		}
+
+		if(linkName != NULL) {
+			tarWriteHeader(outFile, relativePath, linkName, file->permissions.fileMode & 07777,
+						   file->permissions.ownerID, file->permissions.groupID,
+						   0, file->contentModDate, '2');
+			(*count)++;
+			if(!silence) {
+				printf("symlink: %s -> %s\n", relativePath, linkName);
+			}
+			free(linkName);
+		} else {
+			uint64_t size = tarFileDataSize(volume, file);
+			tarWriteHeader(outFile, relativePath, NULL, file->permissions.fileMode & 07777,
+						   file->permissions.ownerID, file->permissions.groupID,
+						   size, file->contentModDate, '0');
+			writeToFile(file, outFile, volume);
+			tarWritePadding(outFile, size);
+			(*count)++;
+			*totalBytes += size;
+			if(!silence) {
+				printf("file: %s (%04o), size = %" PRIu64 "\n", relativePath, file->permissions.fileMode & 07777, size);
+			}
+		}
+	}
+}
+
+void hfs_tar(Volume* volume, AbstractFile* outFile, const char* path) {
+	unsigned int count = 0;
+	uint64_t totalBytes = 0;
+	char normalizedPath[2048];
+	char relativePath[2048];
+	static const unsigned char endBlock[1024];
+	size_t length;
+
+	/* normalize: strip trailing slashes (but keep "/") */
+	length = strlen(path);
+	if(length >= sizeof(normalizedPath)) {
+		length = sizeof(normalizedPath) - 1;
+	}
+	memcpy(normalizedPath, path, length);
+	normalizedPath[length] = '\0';
+	while(length > 1 && normalizedPath[length - 1] == '/') {
+		normalizedPath[--length] = '\0';
+	}
+
+	if(strcmp(normalizedPath, "/") == 0) {
+		/* archive the contents of the root volume without emitting a root entry */
+		HFSPlusCatalogRecord* record = getRecordFromPath("/", volume, NULL, NULL);
+		if(record == NULL) {
+			printf("No such file or directory: %s\n", normalizedPath);
+			outFile->write(outFile, (void*) endBlock, sizeof(endBlock));
+			return;
+		}
+		hfs_tar_folder(volume, outFile, ((HFSPlusCatalogFolder*) record)->folderID, "", &count, &totalBytes);
+		free(record);
+	} else {
+		const char* base = strrchr(normalizedPath, '/');
+		HFSPlusCatalogRecord* record;
+
+		base = base ? base + 1 : normalizedPath;
+		snprintf(relativePath, sizeof(relativePath), "%s", base);
+
+		record = getRecordFromPath(normalizedPath, volume, NULL, NULL);
+		if(record == NULL) {
+			printf("No such file or directory: %s\n", normalizedPath);
+			outFile->write(outFile, (void*) endBlock, sizeof(endBlock));
+			return;
+		}
+		hfs_tar_record(volume, outFile, record, relativePath, &count, &totalBytes);
+		free(record);
+	}
+
+	/* an end of archive marker: two empty 512-byte blocks */
+	outFile->write(outFile, (void*) endBlock, sizeof(endBlock));
+
+	if(!silence) {
+		printf("tarred %u files/folders (%" PRIu64 " bytes) to archive\n", count, totalBytes);
+	}
+}

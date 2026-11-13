@@ -81,6 +81,7 @@ io_func* openFlatFile(const char* fileName) {
   io->read = &flatFileRead;
   io->write = &flatFileWrite;
   io->close = &closeFlatFile;
+  io->truncate = NULL;
   
   return io;
 }
@@ -99,6 +100,7 @@ io_func* openFlatFileRO(const char* fileName) {
   io->read = &flatFileRead;
   io->write = &flatFileWrite;
   io->close = &closeFlatFile;
+  io->truncate = NULL;
   
   return io;
 }

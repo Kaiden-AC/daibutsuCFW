@@ -10,6 +10,8 @@ extern "C" {
 	void get_hfs(Volume* volume, const char* inFileName, AbstractFile* output);
 	int add_hfs(Volume* volume, AbstractFile* inFile, const char* outFileName);
 	void grow_hfs(Volume* volume, uint64_t newSize);
+	void shrink_hfs(Volume* volume, uint64_t newSize);
+	void shrink_hfs_min(Volume* volume);
 	void removeAllInFolder(HFSCatalogNodeID folderID, Volume* volume, const char* parentName);
 	void addAllInFolder(HFSCatalogNodeID folderID, Volume* volume, const char* parentName);
 	void addall_hfs(Volume* volume, const char* dirToMerge, const char* dest);
@@ -17,6 +19,7 @@ extern "C" {
 	int copyAcrossVolumes(Volume* volume1, Volume* volume2, char* path1, char* path2);
 
 	void hfs_untar(Volume* volume, AbstractFile* tarFile);
+	void hfs_tar(Volume* volume, AbstractFile* tarFile, const char* path);
 	void hfs_ls(Volume* volume, const char* path);
 	void hfs_list(Volume* volume, const char* path, int recursive);
 	void hfs_setsilence(int s);

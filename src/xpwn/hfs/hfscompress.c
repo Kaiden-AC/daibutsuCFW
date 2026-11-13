@@ -58,6 +58,13 @@ static int compressedRead(io_func* io, off_t location, size_t size, void *buffer
 			break;
 
 		// Try to cache
+		if(data->blocks == NULL || data->io == NULL) {
+			/* inline (or unknown) data could not satisfy this read; fail rather than crash */
+			memset(buffer, 0, size);
+			return FALSE;
+		}
+
+		{
 		uLongf actualSize;
 		uint32_t block = location / 0x10000;
 		uint8_t* compressed = (uint8_t*) malloc(data->blocks->blocks[block].size);
@@ -83,6 +90,7 @@ static int compressedRead(io_func* io, off_t location, size_t size, void *buffer
 		data->cachedStart = block * 0x10000;
 		data->cachedEnd = data->cachedStart + actualSize;
 		free(compressed);
+		}
 	}
 
 	return TRUE;
@@ -248,6 +256,7 @@ io_func* openHFSPlusCompressed(Volume* volume, HFSPlusCatalogFile* file) {
 	io->read = &compressedRead;
 	io->write = &compressedWrite;
 	io->close = &closeHFSPlusCompressed;
+	io->truncate = NULL;
 
 	data->cached = NULL;
 	data->cachedStart = 0;
@@ -268,9 +277,21 @@ io_func* openHFSPlusCompressed(Volume* volume, HFSPlusCatalogFile* file) {
 	if(data->decmpfs->flags == 0x3) {
 		data->cached = (uint8_t*) malloc(data->decmpfs->size);
 		actualSize = data->decmpfs->size;
-		uncompress(data->cached, &actualSize, data->decmpfs->data, data->decmpfsSize - sizeof(HFSPlusDecmpfs));
-		if(actualSize != data->decmpfs->size) {
-			fprintf(stderr, "decmpfs: size mismatch\n");
+		int rv = uncompress(data->cached, &actualSize, data->decmpfs->data, data->decmpfsSize - sizeof(HFSPlusDecmpfs));
+		if(rv != Z_OK || actualSize != data->decmpfs->size) {
+			size_t srcLen = (size_t) data->decmpfsSize - sizeof(HFSPlusDecmpfs);
+			/* some iOS builds store inline uncompressed data as a leading 0xff marker
+			   followed by the raw file content */
+			if(srcLen >= 1 && data->decmpfs->data[0] == 0xff && (uint64_t)(srcLen - 1) == data->decmpfs->size) {
+				memcpy(data->cached, data->decmpfs->data + 1, (size_t) data->decmpfs->size);
+				actualSize = data->decmpfs->size;
+			} else {
+				if(rv != Z_OK) {
+					fprintf(stderr, "decmpfs: uncompress failed (%d)\n", rv);
+				} else {
+					fprintf(stderr, "decmpfs: size mismatch\n");
+				}
+			}
 		}
 		data->cachedStart = 0;
 		data->cachedEnd = actualSize;

@@ -91,13 +91,17 @@ struct io_func_struct;
 typedef int (*readFunc)(struct io_func_struct* io, off_t location, size_t size, void *buffer);
 typedef int (*writeFunc)(struct io_func_struct* io, off_t location, size_t size, void *buffer);
 typedef void (*closeFunc)(struct io_func_struct* io);
+typedef int (*truncateFunc)(struct io_func_struct* io, off_t size);
 
 typedef struct io_func_struct {
   void* data;
   readFunc read;
   writeFunc write;
   closeFunc close;
+  truncateFunc truncate; /* may be NULL; a negative size is a no-op writability probe */
 } io_func;
+
+#define TRUNCATE(a, b) ((a)->truncate != NULL ? ((*((a)->truncate))(a, b)) : FALSE)
 
 struct AbstractFile;
 

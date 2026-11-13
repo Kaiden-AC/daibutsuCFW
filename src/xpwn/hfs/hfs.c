@@ -263,6 +263,82 @@ void cmd_grow(Volume* volume, int argc, const char *argv[]) {
 	printf("grew volume: %" PRId64 "\n", newSize);
 }
 
+void cmd_shrink(Volume* volume, int argc, const char *argv[]) {
+	uint64_t newSize;
+
+	if(argc < 2) {
+		printf("Not enough arguments\n");
+		return;
+	}
+
+	newSize = 0;
+	if(sscanf(argv[1], "%" PRIu64, &newSize) != 1 || newSize == 0) {
+		printf("Invalid size: %s\n", argv[1]);
+		return;
+	}
+
+	shrink_hfs(volume, newSize);
+}
+
+void cmd_shrinkmin(Volume* volume, int argc, const char *argv[]) {
+	(void)argc;
+	(void)argv;
+	shrink_hfs_min(volume);
+}
+
+void cmd_capacity(AbstractFile* image, int argc, const char *argv[]) {
+	uint64_t length;
+	uint64_t capacity;
+	off_t pos;
+	UDIFResourceFile resourceFile;
+
+	(void)argc;
+	(void)argv;
+
+	length = (uint64_t) image->getLength(image);
+	capacity = length;
+
+	/* a UDIF wrapper (UDZO, etc.) stores the uncompressed capacity of the image in its trailer,
+	   regardless of how the payload is compressed; a flat image is already uncompressed */
+	if(length >= (uint64_t) sizeof(UDIFResourceFile)) {
+		pos = image->tell(image);
+		image->seek(image, (off_t) (length - sizeof(UDIFResourceFile)));
+		if(readUDIFResourceFile(image, &resourceFile, FALSE) == 0) {
+			capacity = resourceFile.fUDIFSectorCount * SECTOR_SIZE;
+		}
+		image->seek(image, pos);
+	}
+
+	printf("%" PRIu64 "\n", capacity);
+}
+
+void cmd_tar(Volume* volume, int argc, const char *argv[]) {
+	AbstractFile *outFile;
+	const char *outName;
+	const char *path = "/";
+
+	if(argc < 2) {
+		printf("usage: tar <output-tar> [path]\n");
+		return;
+	}
+
+	outName = argv[1];
+	if(argc > 2) {
+		path = argv[2];
+	}
+
+	outFile = createAbstractFileFromFile(fopen(outName, "wb"));
+
+	if(outFile == NULL) {
+		printf("cannot create file: %s\n", outName);
+		return;
+	}
+
+	hfs_tar(volume, outFile, path);
+
+	outFile->close(outFile);
+}
+
 void cmd_untar(Volume* volume, int argc, const char *argv[]) {
 	AbstractFile *inFile;
 	
@@ -330,7 +406,7 @@ int main(int argc, const char *argv[]) {
 	TestByteOrder();
 	
 	if(argc < 3) {
-		printf("usage: %s <image-file> (-k <key>) <ls|cat|mv|symlink|mkdir|add|rm|chmod|chown|extract|extractall|rmall|addall|grow|untar|getattr|debug> <arguments>\n", argv[0]);
+		printf("usage: %s <image-file> (-k <key>) <ls|cat|mv|symlink|mkdir|add|rm|chmod|chown|extract|extractall|rmall|addall|grow|shrink|shrink-min|untar|tar|getattr|capacity|debug> <arguments>\n", argv[0]);
 		return 0;
 	}
 	
@@ -385,8 +461,16 @@ int main(int argc, const char *argv[]) {
 			cmd_addall(volume, argc - 2, argv + 2);
 		} else if(strcmp(argv[2], "grow") == 0) {
 			cmd_grow(volume, argc - 2, argv + 2);
+		} else if(strcmp(argv[2], "shrink") == 0) {
+			cmd_shrink(volume, argc - 2, argv + 2);
+		} else if(strcmp(argv[2], "shrink-min") == 0) {
+			cmd_shrinkmin(volume, argc - 2, argv + 2);
+		} else if(strcmp(argv[2], "capacity") == 0) {
+			cmd_capacity(image, argc - 2, argv + 2);
 		} else if(strcmp(argv[2], "untar") == 0) {
 			cmd_untar(volume, argc - 2, argv + 2);
+		} else if(strcmp(argv[2], "tar") == 0) {
+			cmd_tar(volume, argc - 2, argv + 2);
 		} else if(strcmp(argv[2], "getattr") == 0) {
 			cmd_getattr(volume, argc - 2, argv + 2);
 		} else if(strcmp(argv[2], "debug") == 0) {

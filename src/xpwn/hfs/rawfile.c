@@ -494,6 +494,7 @@ io_func* openRawFile(HFSCatalogNodeID id, HFSPlusForkData* forkData, HFSPlusCata
 	io->read = &rawFileRead;
 	io->write = &rawFileWrite;
 	io->close = &closeRawFile;
+	io->truncate = NULL;
 
 	if(!readExtents(rawFile)) {
 		return NULL;
